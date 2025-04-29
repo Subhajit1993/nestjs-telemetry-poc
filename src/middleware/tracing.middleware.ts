@@ -2,6 +2,7 @@ import { Injectable, NestMiddleware } from '@nestjs/common';
 import { NextFunction, Request, Response } from 'express';
 import {
   context,
+  Context,
   propagation,
   ROOT_CONTEXT,
   SpanContext,
@@ -9,132 +10,85 @@ import {
   TraceFlags,
 } from '@opentelemetry/api';
 
+// Create a custom interface extending Express.Request
+export interface RequestWithTrace extends Request {
+  traceContext: Context;
+
+  getTraceContext(): Context;
+
+  getActiveSpan(): ReturnType<typeof trace.getSpan>;
+}
+
 @Injectable()
 export class TracingMiddleware implements NestMiddleware {
-  use(req: Request, res: Response, next: NextFunction) {
+  use(req: RequestWithTrace, res: Response, next: NextFunction) {
     const tracer = trace.getTracer('nestjs-app');
     const requestId = req.headers['x-request-id'] as string;
+    const traceparent = req.headers['traceparent'] as string;
 
-    if (!requestId) {
-      next();
-      return;
-    }
+    console.log('traceparent ID received:', traceparent);
+    console.log('x-request-id received:', requestId);
 
-    // Try to extract parent context first
-    const parentContext = propagation.extract(ROOT_CONTEXT, req.headers);
-    const parentSpan = trace.getSpan(parentContext);
+    let parentContext: Context;
 
-    // Determine trace ID and remote status
-    let traceId: string;
-    let isRemote = false;
-    let parentSpanId: string | undefined;
-
-    if (parentSpan) {
-      // Use parent's trace ID if it exists
-      const parentSpanContext = parentSpan.spanContext();
-      traceId = parentSpanContext.traceId;
-      isRemote = true;
-      parentSpanId = parentSpanContext.spanId;
-
-      console.log('Using parent context:', {
-        parentTraceId: traceId,
-        parentSpanId,
-        traceparent: req.headers.traceparent,
-      });
+    if (traceparent) {
+      // If traceparent exists, extract the remote context
+      parentContext = propagation.extract(ROOT_CONTEXT, req.headers);
+      console.log('Using remote context from traceparent');
     } else {
-      // No parent context, use request ID
-      traceId = this.normalizeTraceId(requestId);
-      isRemote = false;
+      // Create a new local context using request ID
+      const customSpanContext: SpanContext = {
+        traceId: requestId,
+        spanId: this.generateSpanId(),
+        traceFlags: TraceFlags.SAMPLED,
+        isRemote: false, // Local context
+      };
+      parentContext = trace.setSpanContext(ROOT_CONTEXT, customSpanContext);
+      console.log('Created new local context with request ID');
     }
 
-    const spanId = this.generateSpanId();
-
-    // Create explicit span context
-    const spanContext: SpanContext = {
-      traceId,
-      spanId,
-      traceFlags: TraceFlags.SAMPLED,
-      isRemote,
-    };
-    if (parentSpanId) {
-      // If we have a parent span, set it as an attribute
-      // This helps with debugging parent-child relationships
-      (spanContext as any).parentSpanId = parentSpanId;
-    }
-
-    console.log('Creating span with context:', {
-      traceId,
-      spanId,
-      requestId,
-      isRemote,
-    });
-
-    // Create new context with our span context
-    const ctx = trace.setSpanContext(ROOT_CONTEXT, spanContext);
-
-    // Start span with context as third parameter
+    // Start a new span with our parent context
     const span = tracer.startSpan(
-      `${req.method} ${req.path}`,
+      `${req.method} ${req.originalUrl}`,
       {
         attributes: {
           'http.method': req.method,
-          'http.target': req.path,
+          'endpoint.name': req.originalUrl,
           'http.user_agent': req.get('user-agent'),
-          'request.id': requestId,
-          'trace.is_remote': isRemote,
+          'trace.is_remote': !!traceparent, // Add attribute to indicate if remote
         },
         kind: 1, // Server
       },
-      ctx,
+      parentContext,
     );
 
-    // Add debug headers to see what's being set
-    res.setHeader('x-span-id', spanId);
-    res.setHeader('x-request-id', requestId);
-    res.setHeader('x-trace-id', span.spanContext().traceId);
+    // Create new context with our span
+    const ctx = trace.setSpan(parentContext, span);
 
-    // Inject context into response headers for downstream services
-    const contextWithSpan = trace.setSpan(ROOT_CONTEXT, span);
-    propagation.inject(contextWithSpan, res, {
+    // Inject the context into response headers for downstream services
+    propagation.inject(ctx, res, {
       set: (carrier, key, value) => {
         res.setHeader(key, value);
       },
     });
 
-    return context.with(trace.setSpan(context.active(), span), () => {
-      const startTime = Date.now();
+    // Add helper methods to request object
+    req.traceContext = ctx;
+    req.getTraceContext = () => ctx;
+    req.getActiveSpan = () => trace.getSpan(ctx);
 
+    return context.with(ctx, () => {
+      // End span when response finishes
+      res.setHeader('x-request-id', requestId);
+      res.setHeader('x-trace-id', span.spanContext().traceId);
       res.on('finish', () => {
         span.setAttributes({
           'http.status_code': res.statusCode,
-          'http.duration_ms': Date.now() - startTime,
         });
-
-        console.log('Finishing span:', {
-          traceId: span.spanContext().traceId,
-          spanId: span.spanContext().spanId,
-          requestId,
-          isRemote,
-        });
-
         span.end();
       });
-
       next();
     });
-  }
-
-  private normalizeTraceId(id: string): string {
-    // if valid trace ID, return
-    if (id.length === 32) {
-      return id;
-    }
-
-    // Convert to hex if not already
-    const hex = Buffer.from(id).toString('hex');
-
-    // Pad or truncate to exactly 32 chars
-    return hex.padEnd(32, '0').slice(0, 32);
   }
 
   private generateSpanId(): string {
